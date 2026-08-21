@@ -317,6 +317,63 @@ local function cycleModel(dir)
   end
 end
 
+local function caretBounds()
+  local ok, bounds = pcall(function()
+    local focused = hs.axuielement.systemWideElement():attributeValue("AXFocusedUIElement")
+    if not focused then
+      return nil
+    end
+    local range = focused:attributeValue("AXSelectedTextRange")
+    if not range or not range.location then
+      return nil
+    end
+    if range.length == 0 and range.location > 0 then
+      range = { location = range.location - 1, length = 1 }
+    end
+    local b = focused:parameterizedAttributeValue("AXBoundsForRange", range)
+    if b and b.x and b.h and b.h > 0 and not (b.x == 0 and b.y == 0) then
+      return b
+    end
+    return nil
+  end)
+  if ok then
+    return bounds
+  end
+  return nil
+end
+
+local function screenForPoint(p)
+  for _, s in ipairs(hs.screen.allScreens()) do
+    local f = s:frame()
+    if p.x >= f.x and p.x <= f.x + f.w and p.y >= f.y and p.y <= f.y + f.h then
+      return s
+    end
+  end
+  return hs.screen.mainScreen()
+end
+
+local function panelRect()
+  local caret = caretBounds()
+  if not caret then
+    local frame = hs.screen.mainScreen():frame()
+    return {
+      x = frame.x + (frame.w - PANEL_W) / 2,
+      y = math.min(frame.y + frame.h * 0.60, frame.y + frame.h - PANEL_MAX_H - 20),
+      w = PANEL_W,
+      h = PANEL_MIN_H,
+    }
+  end
+  local frame = screenForPoint({ x = caret.x, y = caret.y }):frame()
+  local x = caret.x - PANEL_PAD_X - 14
+  x = math.max(frame.x - PANEL_PAD_X + 8, math.min(x, frame.x + frame.w - PANEL_W + PANEL_PAD_X - 8))
+  local y = caret.y + caret.h + 8 - PANEL_PAD_TOP
+  if y + PANEL_MAX_H > frame.y + frame.h then
+    y = caret.y - PANEL_MIN_H - 8 + PANEL_PAD_BOTTOM
+  end
+  y = math.max(frame.y, y)
+  return { x = x, y = y, w = PANEL_W, h = PANEL_MIN_H }
+end
+
 local function showPanel()
   selectedModel()
   draft = ""
@@ -327,13 +384,7 @@ local function showPanel()
   end
   currentShotPath = shot
 
-  local frame = hs.screen.mainScreen():frame()
-  local rect = {
-    x = frame.x + (frame.w - PANEL_W) / 2,
-    y = math.min(frame.y + frame.h * 0.60, frame.y + frame.h - PANEL_MAX_H - 20),
-    w = PANEL_W,
-    h = PANEL_MIN_H,
-  }
+  local rect = panelRect()
 
   webView = hs.webview.new(rect)
   webView:windowStyle({ "borderless", "nonactivating" })
