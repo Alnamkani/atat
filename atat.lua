@@ -6,10 +6,11 @@ M.panelOpen = false
 
 M.config = {
   models = {
-    { label = "Haiku (fast)", value = "haiku" },
-    { label = "Sonnet", value = "sonnet" },
-    { label = "Opus (deepest)", value = "opus" },
+    { label = "haiku", value = "haiku" },
+    { label = "sonnet", value = "sonnet" },
+    { label = "opus", value = "opus" },
   },
+  defaultModel = "sonnet",
   cacheDir = os.getenv("HOME") .. "/.cache/atat",
   toggleMods = { "alt", "shift" },
   toggleKey = "a",
@@ -17,6 +18,8 @@ M.config = {
   restoreDelayMs = 350,
   formatRule = "Return ONLY the text to insert. No preamble, no explanation, no markdown fences.",
 }
+
+local REPOST_MARK = 0xA7A7
 
 local function findClaude()
   local candidates = {
@@ -43,22 +46,27 @@ local draft = ""
 
 local function flushPending()
   if pendingAt then
-    pendingAt:post()
+    local ev = pendingAt
     pendingAt = nil
+    ev:setProperty(hs.eventtap.event.properties.eventSourceUserData, REPOST_MARK)
+    ev:post()
   end
   if pendingTimer then
     pendingTimer:stop()
     pendingTimer = nil
   end
 end
+
 local modelIdx = 1
 local savedBundleID = nil
 local savedClipboard = nil
 local currentShotPath = nil
 local webView = nil
-local thinkingAlert = nil
+local currentTask = nil
+local queryGen = 0
 
 os.execute("/bin/mkdir -p '" .. M.config.cacheDir .. "'")
+os.execute("/usr/bin/find '" .. M.config.cacheDir .. "' -name 'shot-*.png' -mtime +1 -delete 2>/dev/null")
 
 M.logError = function(context, err)
   local line = string.format("[%s] %s: %s\n%s\n\n",
@@ -72,19 +80,14 @@ M.logError = function(context, err)
 end
 
 local function selectedModel()
-  local saved = hs.settings.get("atat.model")
   for i, m in ipairs(M.config.models) do
-    if m.value == saved then
+    if m.value == M.config.defaultModel then
       modelIdx = i
       return m.value
     end
   end
   modelIdx = 1
   return M.config.models[1].value
-end
-
-local function rememberModel(value)
-  hs.settings.set("atat.model", value)
 end
 
 local function captureScreenshot()
@@ -112,71 +115,183 @@ local function jsStr(s)
   return '"' .. s .. '"'
 end
 
+local function utf8Backspace(s)
+  if #s == 0 then
+    return s
+  end
+  local i = #s
+  while i > 1 and s:byte(i) >= 0x80 and s:byte(i) < 0xC0 do
+    i = i - 1
+  end
+  return s:sub(1, i - 1)
+end
+
+local PANEL_W = 640
+local PANEL_PAD_X = 30
+local PANEL_PAD_TOP = 22
+local PANEL_PAD_BOTTOM = 34
+local PANEL_MIN_H = 148
+local PANEL_MAX_H = 380
+
 local function panelHtml()
+  local segs = {}
+  for i, m in ipairs(M.config.models) do
+    segs[#segs + 1] = string.format('<span id="seg%d">%s</span>', i, m.label)
+  end
   return [[
 <!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
+  :root { color-scheme: dark; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: transparent; }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-    background: rgba(28, 28, 32, 0.94);
-    color: #eee;
-    padding: 14px;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    padding: ]] .. PANEL_PAD_TOP .. "px " .. PANEL_PAD_X .. "px " .. PANEL_PAD_BOTTOM .. [[px;
+    -webkit-user-select: none;
+    overflow: hidden;
   }
-  .line { font-size: 15px; min-height: 44px; word-break: break-word; white-space: pre-wrap; }
-  .line.empty { opacity: 0.4; }
-  .cursor { display: inline-block; width: 2px; height: 16px; background: #d97757;
-            vertical-align: text-bottom; animation: blink 1s steps(1) infinite; }
+  #card {
+    background: linear-gradient(180deg, rgba(42, 42, 48, 0.97), rgba(26, 26, 30, 0.97));
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    border-radius: 16px;
+    box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.65),
+                0 18px 50px rgba(0, 0, 0, 0.55),
+                inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    padding: 15px 18px 11px;
+    color: #ececf0;
+    animation: pop 0.18s cubic-bezier(0.2, 0.9, 0.3, 1.15);
+  }
+  @keyframes pop { from { opacity: 0; transform: translateY(6px) scale(0.985); } }
+  .top { display: flex; gap: 12px; align-items: flex-start; }
+  .sigil {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 17px; font-weight: 700; letter-spacing: -0.5px;
+    color: #d97757; padding-top: 2px;
+  }
+  #card.thinking .sigil { animation: pulse 1.1s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.3; } }
+  .line {
+    flex: 1; font-size: 16px; line-height: 1.45; min-height: 47px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .line.empty { color: #75757e; }
+  #card.thinking .line { color: #8b8b93; }
+  .cursor {
+    display: inline-block; width: 2px; height: 1.1em; margin-left: 1px;
+    background: #d97757; vertical-align: -0.15em;
+    animation: blink 1.1s steps(1) infinite;
+  }
   @keyframes blink { 50% { opacity: 0; } }
-  .row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
-  #mdl { font-size: 12px; color: #d97757; font-weight: 600; }
-  .badge { font-size: 11px; opacity: 0.55; }
-  .badge.ok { opacity: 0.95; color: #7ec97e; }
+  #card.thinking .cursor { animation: pulse 1.1s ease-in-out infinite; }
+  .row {
+    display: flex; align-items: center; gap: 10px;
+    margin-top: 10px; padding-top: 10px;
+    border-top: 1px solid rgba(255, 255, 255, 0.07);
+  }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; color: #8b8b93;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 7px; padding: 3px 9px;
+  }
+  .chip .dot { width: 6px; height: 6px; border-radius: 50%; background: #565660; }
+  .chip.ok { color: #c8cbc8; }
+  .chip.ok .dot { background: #7ec97e; box-shadow: 0 0 6px rgba(126, 201, 126, 0.7); }
+  .seg {
+    display: flex; gap: 1px;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 7px; padding: 2px;
+  }
+  .seg span {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px; padding: 2px 9px; border-radius: 5px; color: #8b8b93;
+  }
+  .seg span.on { background: #d97757; color: #1b1b1e; font-weight: 600; }
   .spacer { flex: 1; }
-  .hint { font-size: 11px; opacity: 0.45; }
+  .hint { font-size: 11px; color: #68686f; }
+  .hint b { font-weight: 500; color: #8b8b93; }
+  @media (prefers-reduced-motion: reduce) {
+    #card, .cursor, #card.thinking .sigil { animation: none; }
+  }
 </style>
 </head>
 <body>
-  <div id="txt" class="line empty"></div>
-  <div class="row">
-    <span id="mdl"></span>
-    <span id="shot" class="badge">no screenshot</span>
-    <span class="spacer"></span>
-    <span class="hint">&#8984;&#9166;/&#9166; send &#183; tab model &#183; esc cancel</span>
+  <div id="card">
+    <div class="top">
+      <span class="sigil">@@</span>
+      <div id="txt" class="line empty"></div>
+    </div>
+    <div class="row">
+      <span id="shot" class="chip"><span class="dot"></span><span id="shotlbl">no screenshot</span></span>
+      <div class="seg">]] .. table.concat(segs) .. [[</div>
+      <span class="spacer"></span>
+      <span id="hint" class="hint"></span>
+    </div>
   </div>
 <script>
+  const card = document.getElementById('card');
   const txt = document.getElementById('txt');
-  const PHRASE = "Type your prompt…";
+  const hint = document.getElementById('hint');
+  const PHRASE = "Ask about what you see\u2026";
+  const IDLE_HINT = '<b>\u21e5</b> model \u00b7 <b>\u23ce</b> send \u00b7 <b>esc</b>';
+  hint.innerHTML = IDLE_HINT;
   function upd(t) {
     if (t.length === 0) {
-      txt.textContent = PHRASE;
       txt.className = "line empty";
-      txt.innerHTML = PHRASE + ' <span class="cursor"></span>';
+      txt.textContent = PHRASE;
     } else {
       txt.className = "line";
       txt.textContent = t;
-      const c = document.createElement("span");
-      c.className = "cursor";
-      txt.appendChild(c);
     }
+    const c = document.createElement("span");
+    c.className = "cursor";
+    txt.appendChild(c);
+    return document.body.offsetHeight;
   }
   function shot(ok) {
-    const el = document.getElementById('shot');
-    el.textContent = ok ? "screenshot attached" : "no screenshot";
-    el.className = ok ? "badge ok" : "badge";
+    document.getElementById('shot').className = ok ? "chip ok" : "chip";
+    document.getElementById('shotlbl').textContent = ok ? "screen attached" : "no screenshot";
+  }
+  function model(idx) {
+    document.querySelectorAll('.seg span').forEach((el, i) => {
+      el.className = (i === idx - 1) ? "on" : "";
+    });
+  }
+  function think(on) {
+    card.classList.toggle('thinking', on);
+    hint.innerHTML = on ? 'thinking \u00b7 <b>esc</b> cancel' : IDLE_HINT;
   }
 </script>
 </body>
 </html>]]
 end
 
+local function syncHeight()
+  if not webView then
+    return
+  end
+  webView:evaluateJavaScript("document.body.offsetHeight", function(h)
+    if type(h) ~= "number" or not webView then
+      return
+    end
+    local newH = math.min(PANEL_MAX_H, math.max(PANEL_MIN_H, math.floor(h)))
+    local f = webView:frame()
+    if math.abs(f.h - newH) > 2 then
+      f.h = newH
+      webView:frame(f)
+    end
+  end)
+end
+
 local function updateUI()
   if webView then
     local ok, err = pcall(function()
       webView:evaluateJavaScript("upd(" .. jsStr(draft) .. ")")
+      syncHeight()
     end)
     if not ok then
       M.logError("updateUI", err)
@@ -195,11 +310,9 @@ end
 
 local function cycleModel(dir)
   modelIdx = ((modelIdx - 1 + dir) % #M.config.models) + 1
-  rememberModel(M.config.models[modelIdx].value)
   if webView then
     pcall(function()
-      webView:evaluateJavaScript("document.getElementById('mdl').textContent=" ..
-        jsStr(M.config.models[modelIdx].label))
+      webView:evaluateJavaScript("model(" .. modelIdx .. ")")
     end)
   end
 end
@@ -215,11 +328,19 @@ local function showPanel()
   currentShotPath = shot
 
   local frame = hs.screen.mainScreen():frame()
-  local w, h = 560, 120
-  local rect = { x = frame.x + (frame.w - w) / 2, y = frame.y + frame.h * 0.62, w = w, h = h }
+  local rect = {
+    x = frame.x + (frame.w - PANEL_W) / 2,
+    y = math.min(frame.y + frame.h * 0.60, frame.y + frame.h - PANEL_MAX_H - 20),
+    w = PANEL_W,
+    h = PANEL_MIN_H,
+  }
 
   webView = hs.webview.new(rect)
+  webView:windowStyle({ "borderless", "nonactivating" })
+  webView:transparent(true)
+  webView:shadow(false)
   webView:level(hs.drawing.windowLevels.floating)
+  webView:behaviorAsLabels({ "canJoinAllSpaces", "transient" })
   webView:darkMode(true)
   webView:html(panelHtml())
   webView:show()
@@ -229,8 +350,9 @@ local function showPanel()
       pcall(function()
         webView:evaluateJavaScript(
           "shot(" .. tostring(shot ~= nil) .. ");" ..
-          "document.getElementById('mdl').textContent=" .. jsStr(M.config.models[modelIdx].label) .. ";" ..
-          "upd(" .. jsStr("") .. ")")
+          "model(" .. modelIdx .. ");" ..
+          "upd(\"\")")
+        syncHeight()
       end)
     end
   end)
@@ -239,6 +361,12 @@ local function showPanel()
 end
 
 function M.cancelPrompt()
+  queryGen = queryGen + 1
+  if currentTask then
+    pcall(function() currentTask:terminate() end)
+    currentTask = nil
+  end
+  M.busy = false
   closePanel()
   draft = ""
   currentShotPath = nil
@@ -250,20 +378,28 @@ function M.runQuery(prompt)
   end
   prompt = prompt:gsub("^%s+", ""):gsub("%s+$", "")
   if prompt == "" then
+    M.cancelPrompt()
     return
   end
   if not M.claudePath then
+    M.cancelPrompt()
     hs.alert.show("at-at: claude binary not found")
     return
   end
 
   M.busy = true
-  thinkingAlert = hs.alert.show("at-at: thinking…", {}, hs.screen.mainScreen(), 3600)
+  queryGen = queryGen + 1
+  local gen = queryGen
+  local shotPath = currentShotPath
+
+  if webView then
+    pcall(function() webView:evaluateJavaScript("think(true)") end)
+  end
 
   local fullPrompt = prompt
-  if currentShotPath then
+  if shotPath then
     fullPrompt = fullPrompt .. "\n\n[Context: a screenshot of the user's screen at trigger time is saved at "
-      .. currentShotPath .. ". Read it with your Read tool if it helps answer.]"
+      .. shotPath .. ". Read it with your Read tool if it helps answer.]"
   end
 
   local args = {
@@ -275,12 +411,16 @@ function M.runQuery(prompt)
   }
 
   local function finish(code, stdout, stderr)
-    if thinkingAlert then
-      hs.alert.closeSpecific(thinkingAlert)
-      thinkingAlert = nil
+    if shotPath then
+      os.remove(shotPath)
     end
+    if gen ~= queryGen then
+      return
+    end
+    currentTask = nil
     M.busy = false
     currentShotPath = nil
+    closePanel()
     if code ~= 0 then
       hs.alert.show("at-at failed: " .. ((stderr ~= "" and stderr) or stdout):sub(1, 160))
       return
@@ -309,13 +449,16 @@ function M.runQuery(prompt)
     end)
   end
 
-  local task = hs.task.new(M.claudePath, finish, args)
-  task:setWorkingDirectory(M.config.cacheDir)
-  task:start()
+  currentTask = hs.task.new(M.claudePath, finish, args)
+  currentTask:setWorkingDirectory(M.config.cacheDir)
+  currentTask:start()
 end
 
 keyTap = hs.eventtap.new({ hs.eventtap.event.types.keyDown }, function(e)
   if not M.enabled then
+    return false
+  end
+  if e:getProperty(hs.eventtap.event.properties.eventSourceUserData) == REPOST_MARK then
     return false
   end
 
@@ -324,29 +467,31 @@ keyTap = hs.eventtap.new({ hs.eventtap.event.types.keyDown }, function(e)
     local chars = e:getCharacters() or ""
     local code = e:getKeyCode()
 
-    if flags.cmd or flags.ctrl then
-      M.cancelPrompt()
-      return false
-    end
     if code == hs.keycodes.map.escape then
       M.cancelPrompt()
       return true
+    end
+    if M.busy then
+      return false
+    end
+    if code == hs.keycodes.map["return"] or code == hs.keycodes.map.padenter then
+      local ok, err = pcall(M.runQuery, draft)
+      if not ok then
+        M.logError("runQuery", err)
+        M.cancelPrompt()
+      end
+      return true
+    end
+    if flags.cmd or flags.ctrl then
+      M.cancelPrompt()
+      return false
     end
     if code == hs.keycodes.map.tab then
       cycleModel(flags.shift and -1 or 1)
       return true
     end
-    if code == hs.keycodes.map["return"] or code == hs.keycodes.map.padenter then
-      local q = draft
-      closePanel()
-      local ok, err = pcall(M.runQuery, q)
-      if not ok then
-        M.logError("runQuery", err)
-      end
-      return true
-    end
     if code == hs.keycodes.map.delete then
-      draft = draft:sub(1, -2)
+      draft = utf8Backspace(draft)
       updateUI()
       return true
     end
@@ -391,7 +536,7 @@ keyTap = hs.eventtap.new({ hs.eventtap.event.types.keyDown }, function(e)
       end
       return true
     end
-    pendingAt = e
+    pendingAt = e:copy()
     pendingTimer = hs.timer.doAfter(0.15, flushPending)
     return true
   end
